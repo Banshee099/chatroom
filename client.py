@@ -8,7 +8,7 @@ class ChatClient(cmd.Cmd):
     prompt = '> '
     intro = "Welcome to the Python Chat Room! Type 'help' for a list of commands."
 
-    def __init__(self, host='192.168.1.4', port=8080):
+    def __init__(self, host='192.168.1.4', port=8000):
         super().__init__()
         self.host = host
         self.port = port
