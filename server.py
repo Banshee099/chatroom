@@ -208,7 +208,7 @@ class ChatServer:
     def handle_client(self, client_socket, address):
         username = None
         try:
-            username = client_socket.recv(1024).decode('utf-8')
+            username = client_socket.recv(2048).decode('utf-8')
             print(f"User {username} connected from {address[0]}:{address[1]}")
 
             with self.lock:
@@ -216,7 +216,7 @@ class ChatServer:
                 self.broadcast(f"{username} has joined the chat!")
 
             while True:
-                message = client_socket.recv(1024).decode('utf-8')
+                message = client_socket.recv(2048).decode('utf-8')
                 if not message:
                     break
 

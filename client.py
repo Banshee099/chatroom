@@ -408,7 +408,7 @@ class ChatClient(cmd.Cmd):
     def receive_messages(self):
         while self.connected:
             try:
-                message = self.socket.recv(1024).decode('utf-8')
+                message = self.socket.recv(2048).decode('utf-8')
                 if not message:
                     print("Disconnected from server.")
                     self.connected = False
