@@ -5,6 +5,12 @@ import argparse
 import requests
 import json
 import sys
+import base64
+import os
+from cryptography.hazmat.primitives.asymmetric import rsa, padding
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.backends import default_backend
 
 
 class ChatServer:
@@ -14,23 +20,32 @@ class ChatServer:
         self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.server_socket.bind((self.host, self.port))
-        self.clients = {}
+        self.clients = {}  # Maps usernames to (socket, encryption_info) tuples
         self.lock = threading.Lock()
         self.ngrok_url = None
 
+        # Generate server's key pair
+        self.private_key = rsa.generate_private_key(
+            public_exponent=65537,
+            key_size=2048,
+            backend=default_backend()
+        )
+        self.public_key = self.private_key.public_key()
+        self.public_key_pem = self.public_key.public_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PublicFormat.SubjectPublicKeyInfo
+        )
+
     def start(self):
         self.server_socket.listen(5)
-        print(f"Server started on {self.host}:{self.port}")
+        print(f"Encrypted server started on {self.host}:{self.port}")
         print(f"Local IP: {self.get_local_ip()}")
 
         # Check for ngrok tunnel
         self.ngrok_url = self.get_ngrok_url()
         if self.ngrok_url:
             print(f"ngrok tunnel established: {self.ngrok_url}")
-            # Extract host and port from ngrok URL
             print(f"For clients to connect, use: connect username {self.ngrok_url.split('//')[1]}")
-        else:
-            print("No ngrok tunnel found. Clients can only connect using local network.")
 
         try:
             while True:
@@ -42,23 +57,96 @@ class ChatServer:
         finally:
             self.server_socket.close()
 
+    def encrypt_message(self, message, session_key, iv):
+        encryptor = Cipher(
+            algorithms.AES(session_key),
+            modes.CFB(iv),
+            backend=default_backend()
+        ).encryptor()
+
+        encrypted_data = encryptor.update(message.encode('utf-8')) + encryptor.finalize()
+        return base64.b64encode(encrypted_data).decode('utf-8')
+
+    def decrypt_message(self, encrypted_message, session_key, iv):
+        encrypted_data = base64.b64decode(encrypted_message.encode('utf-8'))
+        decryptor = Cipher(
+            algorithms.AES(session_key),
+            modes.CFB(iv),
+            backend=default_backend()
+        ).decryptor()
+
+        decrypted_data = decryptor.update(encrypted_data) + decryptor.finalize()
+        return decrypted_data.decode('utf-8')
+
     def handle_client(self, client_socket, address):
         username = None
+        client_public_key = None
+        session_key = None
+        iv = None
+
         try:
-            username = client_socket.recv(2048).decode('utf-8')
-            print(f"User {username} connected from {address[0]}:{address[1]}")
+            # STEP 1: Send server's public key
+            client_socket.send(self.public_key_pem)
+
+            # STEP 2: Receive client's public key
+            client_public_key_pem = client_socket.recv(4096)
+            client_public_key = serialization.load_pem_public_key(
+                client_public_key_pem,
+                backend=default_backend()
+            )
+
+            # STEP 3: Receive encrypted session key
+            key_size = int.from_bytes(client_socket.recv(4), byteorder='big')
+            encrypted_session_key = client_socket.recv(key_size)
+            iv_size = int.from_bytes(client_socket.recv(4), byteorder='big')
+            encrypted_iv = client_socket.recv(iv_size)
+
+            # Decrypt session key and IV with server's private key
+            session_key = self.private_key.decrypt(
+                encrypted_session_key,
+                padding.OAEP(
+                    mgf=padding.MGF1(algorithm=hashes.SHA256()),
+                    algorithm=hashes.SHA256(),
+                    label=None
+                )
+            )
+
+            iv = self.private_key.decrypt(
+                encrypted_iv,
+                padding.OAEP(
+                    mgf=padding.MGF1(algorithm=hashes.SHA256()),
+                    algorithm=hashes.SHA256(),
+                    label=None
+                )
+            )
+
+            # STEP 4: Receive encrypted username
+            encrypted_username = client_socket.recv(2048).decode('utf-8')
+            username = self.decrypt_message(encrypted_username, session_key, iv)
+
+            print(f"User {username} connected from {address[0]}:{address[1]} (encrypted)")
+
+            # Store client info
+            encryption_info = {
+                'public_key': client_public_key,
+                'session_key': session_key,
+                'iv': iv
+            }
 
             with self.lock:
-                self.clients[username] = client_socket
+                self.clients[username] = (client_socket, encryption_info)
                 self.broadcast(f"{username} has joined the chat!")
 
             while True:
-                message = client_socket.recv(2048).decode('utf-8')
-                if not message:
+                encrypted_message = client_socket.recv(2048).decode('utf-8')
+                if not encrypted_message:
                     break
+
+                message = self.decrypt_message(encrypted_message, session_key, iv)
 
                 with self.lock:
                     self.broadcast(f"{username}: {message}")
+
         except Exception as e:
             print(f"Error handling client {address}: {e}")
         finally:
@@ -73,17 +161,23 @@ class ChatServer:
         print(message)
         disconnected_clients = []
 
-        for username, client in self.clients.items():
+        for uname, (client, encryption_info) in self.clients.items():
             try:
-                client.send(message.encode('utf-8'))
+                # Encrypt message specifically for this client
+                encrypted_msg = self.encrypt_message(
+                    message,
+                    encryption_info['session_key'],
+                    encryption_info['iv']
+                )
+                client.send(encrypted_msg.encode('utf-8'))
             except:
-                disconnected_clients.append(username)
+                disconnected_clients.append(uname)
 
         # Remove disconnected clients
-        for username in disconnected_clients:
-            if username in self.clients:
-                del self.clients[username]
-                print(f"Removed disconnected client: {username}")
+        for uname in disconnected_clients:
+            if uname in self.clients:
+                del self.clients[uname]
+                print(f"Removed disconnected client: {uname}")
 
     def get_local_ip(self):
         """Get the local IP address of the server"""
