@@ -85,43 +85,101 @@ class ChatServer:
         iv = None
 
         try:
-            # STEP 1: Send server's public key
-            client_socket.send(self.public_key_pem)
-
-            # STEP 2: Receive client's public key
-            client_public_key_pem = client_socket.recv(4096)
-            client_public_key = serialization.load_pem_public_key(
-                client_public_key_pem,
-                backend=default_backend()
+            # STEP 1: Send server's public key with proper framing
+            public_key_pem = self.public_key.public_bytes(
+                encoding=serialization.Encoding.PEM,
+                format=serialization.PublicFormat.SubjectPublicKeyInfo
             )
+            client_socket.send(len(public_key_pem).to_bytes(4, byteorder='big'))
+            client_socket.send(public_key_pem)
 
-            # STEP 3: Receive encrypted session key
-            key_size = int.from_bytes(client_socket.recv(4), byteorder='big')
-            encrypted_session_key = client_socket.recv(key_size)
-            iv_size = int.from_bytes(client_socket.recv(4), byteorder='big')
-            encrypted_iv = client_socket.recv(iv_size)
+            # STEP 2: Receive client's public key with proper framing
+            key_size_bytes = client_socket.recv(4)
+            key_size = int.from_bytes(key_size_bytes, byteorder='big')
+
+            client_public_key_pem = b''
+            remaining = key_size
+            while remaining > 0:
+                chunk = client_socket.recv(min(remaining, 4096))
+                if not chunk:
+                    raise ConnectionError("Connection closed during key exchange")
+                client_public_key_pem += chunk
+                remaining -= len(chunk)
+
+            # Load the client's public key
+            try:
+                client_public_key = serialization.load_pem_public_key(
+                    client_public_key_pem,
+                    backend=default_backend()
+                )
+            except Exception as e:
+                print(f"Failed to load client's public key: {e}")
+                print(f"Received data: {client_public_key_pem[:100]}...")
+                raise
+
+            # STEP 3: Receive encrypted session key with proper framing
+            key_size_bytes = client_socket.recv(4)
+            key_size = int.from_bytes(key_size_bytes, byteorder='big')
+
+            encrypted_session_key = b''
+            remaining = key_size
+            while remaining > 0:
+                chunk = client_socket.recv(min(remaining, 4096))
+                if not chunk:
+                    raise ConnectionError("Connection closed during key exchange")
+                encrypted_session_key += chunk
+                remaining -= len(chunk)
+
+            # Receive encrypted IV
+            iv_size_bytes = client_socket.recv(4)
+            iv_size = int.from_bytes(iv_size_bytes, byteorder='big')
+
+            encrypted_iv = b''
+            remaining = iv_size
+            while remaining > 0:
+                chunk = client_socket.recv(min(remaining, 4096))
+                if not chunk:
+                    raise ConnectionError("Connection closed during key exchange")
+                encrypted_iv += chunk
+                remaining -= len(chunk)
 
             # Decrypt session key and IV with server's private key
-            session_key = self.private_key.decrypt(
-                encrypted_session_key,
-                padding.OAEP(
-                    mgf=padding.MGF1(algorithm=hashes.SHA256()),
-                    algorithm=hashes.SHA256(),
-                    label=None
+            try:
+                session_key = self.private_key.decrypt(
+                    encrypted_session_key,
+                    padding.OAEP(
+                        mgf=padding.MGF1(algorithm=hashes.SHA256()),
+                        algorithm=hashes.SHA256(),
+                        label=None
+                    )
                 )
-            )
 
-            iv = self.private_key.decrypt(
-                encrypted_iv,
-                padding.OAEP(
-                    mgf=padding.MGF1(algorithm=hashes.SHA256()),
-                    algorithm=hashes.SHA256(),
-                    label=None
+                iv = self.private_key.decrypt(
+                    encrypted_iv,
+                    padding.OAEP(
+                        mgf=padding.MGF1(algorithm=hashes.SHA256()),
+                        algorithm=hashes.SHA256(),
+                        label=None
+                    )
                 )
-            )
+            except Exception as e:
+                print(f"Failed to decrypt session key/IV: {e}")
+                raise
 
-            # STEP 4: Receive encrypted username
-            encrypted_username = client_socket.recv(2048).decode('utf-8')
+            # STEP 4: Receive encrypted username with proper framing
+            username_size_bytes = client_socket.recv(4)
+            username_size = int.from_bytes(username_size_bytes, byteorder='big')
+
+            encrypted_username_bytes = b''
+            remaining = username_size
+            while remaining > 0:
+                chunk = client_socket.recv(min(remaining, 4096))
+                if not chunk:
+                    raise ConnectionError("Connection closed during username exchange")
+                encrypted_username_bytes += chunk
+                remaining -= len(chunk)
+
+            encrypted_username = encrypted_username_bytes.decode('utf-8')
             username = self.decrypt_message(encrypted_username, session_key, iv)
 
             print(f"User {username} connected from {address[0]}:{address[1]} (encrypted)")
@@ -137,11 +195,26 @@ class ChatServer:
                 self.clients[username] = (client_socket, encryption_info)
                 self.broadcast(f"{username} has joined the chat!")
 
+            # Also need to modify the message receiving loop to use proper framing
             while True:
-                encrypted_message = client_socket.recv(2048).decode('utf-8')
-                if not encrypted_message:
+                # Receive message size
+                size_bytes = client_socket.recv(4)
+                if not size_bytes:
                     break
 
+                msg_size = int.from_bytes(size_bytes, byteorder='big')
+
+                # Receive full message
+                encrypted_message_bytes = b''
+                remaining = msg_size
+                while remaining > 0:
+                    chunk = client_socket.recv(min(remaining, 4096))
+                    if not chunk:
+                        raise ConnectionError("Connection closed during message reception")
+                    encrypted_message_bytes += chunk
+                    remaining -= len(chunk)
+
+                encrypted_message = encrypted_message_bytes.decode('utf-8')
                 message = self.decrypt_message(encrypted_message, session_key, iv)
 
                 with self.lock:
@@ -156,7 +229,6 @@ class ChatServer:
                     self.broadcast(f"{username} has left the chat.")
             client_socket.close()
             print(f"Connection closed for {address[0]}:{address[1]}")
-
     def broadcast(self, message):
         print(message)
         disconnected_clients = []

@@ -109,24 +109,42 @@ class ChatClient(cmd.Cmd):
             print(f"Attempting to connect to {self.host}:{self.port}...")
             self.socket.connect((self.host, self.port))
 
-            # STEP 1: Receive server's public key
-            server_public_key_pem = self.socket.recv(4096)
-            self.server_public_key = serialization.load_pem_public_key(
-                server_public_key_pem,
-                backend=default_backend()
-            )
+            # STEP 1: Receive server's public key using proper framing
+            key_size_bytes = self.socket.recv(4)
+            key_size = int.from_bytes(key_size_bytes, byteorder='big')
+            server_public_key_pem = b''
+            remaining = key_size
+            while remaining > 0:
+                chunk = self.socket.recv(min(remaining, 4096))
+                if not chunk:
+                    raise ConnectionError("Connection closed during key exchange")
+                server_public_key_pem += chunk
+                remaining -= len(chunk)
 
-            # STEP 2: Send client's public key to server
+            # Load the server's public key
+            try:
+                self.server_public_key = serialization.load_pem_public_key(
+                    server_public_key_pem,
+                    backend=default_backend()
+                )
+            except Exception as e:
+                print(f"Failed to load server's public key: {e}")
+                print(f"Received data: {server_public_key_pem[:100]}...")
+                raise
+
+            # STEP 2: Send client's public key to server with proper framing
             public_key_pem = self.public_key.public_bytes(
                 encoding=serialization.Encoding.PEM,
                 format=serialization.PublicFormat.SubjectPublicKeyInfo
             )
+            self.socket.send(len(public_key_pem).to_bytes(4, byteorder='big'))
             self.socket.send(public_key_pem)
 
             # STEP 3: Generate and send session key encrypted with server's public key
             self.session_key = os.urandom(32)  # 256-bit key for AES
             self.iv = os.urandom(16)  # Initialization vector
 
+            # Encrypt the session key with server's public key
             encrypted_session_key = self.server_public_key.encrypt(
                 self.session_key,
                 padding.OAEP(
@@ -135,6 +153,8 @@ class ChatClient(cmd.Cmd):
                     label=None
                 )
             )
+
+            # Encrypt the IV with server's public key
             encrypted_iv = self.server_public_key.encrypt(
                 self.iv,
                 padding.OAEP(
@@ -144,7 +164,7 @@ class ChatClient(cmd.Cmd):
                 )
             )
 
-            # Send encrypted session key and IV
+            # Send encrypted session key and IV with proper framing
             self.socket.send(len(encrypted_session_key).to_bytes(4, byteorder='big'))
             self.socket.send(encrypted_session_key)
             self.socket.send(len(encrypted_iv).to_bytes(4, byteorder='big'))
@@ -152,7 +172,9 @@ class ChatClient(cmd.Cmd):
 
             # STEP 4: Send encrypted username
             encrypted_username = self.encrypt_message(self.username)
-            self.socket.send(encrypted_username.encode('utf-8'))
+            username_data = encrypted_username.encode('utf-8')
+            self.socket.send(len(username_data).to_bytes(4, byteorder='big'))
+            self.socket.send(username_data)
 
             self.connected = True
             threading.Thread(target=self.receive_messages, daemon=True).start()
@@ -160,6 +182,9 @@ class ChatClient(cmd.Cmd):
 
         except Exception as e:
             print(f"Failed to connect: {e}")
+            if self.socket:
+                self.socket.close()
+                self.socket = None
 
     # Remaining methods similar to original, but with encryption/decryption
 
